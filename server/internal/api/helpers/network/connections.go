@@ -13,11 +13,10 @@ import (
 // returns 503, a sampler would mark the dashboard state.
 var ErrConnectionsUnavailable = errors.New("connections unavailable: needs elevated privileges")
 
-// Addr is one end of a connection.
-type Addr struct {
-	IP   string `json:"ip"`
-	Port uint32 `json:"port"`
-}
+// Addr is one end of a connection. gopsutil's type already carries the
+// field names and JSON tags this API emits, so alias it rather than
+// maintaining a parallel copy.
+type Addr = psnet.Addr
 
 // Connection is a single established connection, shaped to match the
 // JSON the Python implementation emitted.
@@ -35,7 +34,7 @@ type Connection struct {
 func GetConnections() ([]Connection, error) {
 	conns, err := psnet.Connections("inet")
 	if err != nil {
-		if isPermissionErr(err) {
+		if errors.Is(err, os.ErrPermission) {
 			return nil, ErrConnectionsUnavailable
 		}
 		return nil, err
@@ -51,19 +50,15 @@ func GetConnections() ([]Connection, error) {
 		}
 
 		conn := Connection{
-			Raddr:  &Addr{IP: c.Raddr.IP, Port: c.Raddr.Port},
+			Raddr:  &c.Raddr,
 			Status: c.Status,
 			PID:    c.Pid,
 		}
 		if c.Laddr.IP != "" {
-			conn.Laddr = &Addr{IP: c.Laddr.IP, Port: c.Laddr.Port}
+			conn.Laddr = &c.Laddr
 		}
 		connections = append(connections, conn)
 	}
 
 	return connections, nil
-}
-
-func isPermissionErr(err error) bool {
-	return errors.Is(err, os.ErrPermission)
 }

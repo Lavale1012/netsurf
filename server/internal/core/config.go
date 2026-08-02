@@ -2,6 +2,7 @@ package core
 
 import (
 	"encoding/json"
+	"log"
 	"os"
 	"strings"
 
@@ -9,7 +10,7 @@ import (
 )
 
 // Settings holds runtime configuration, populated from .env with
-// case-insensitive keys. Field defaults apply when a key is absent.
+// case-insensitive keys.
 type Settings struct {
 	AppName     string
 	APIPrefix   string
@@ -23,47 +24,34 @@ func Load() *Settings {
 	_ = godotenv.Load()
 
 	s := &Settings{
-		AppName:     "net-monitor",
-		APIPrefix:   "/api/v1",
+		AppName:     env("APP_NAME", "net-monitor"),
+		APIPrefix:   env("API_PREFIX", "/api/v1"),
+		Port:        env("PORT", "8000"),
 		CORSOrigins: []string{"http://localhost:5173"},
-		Port:        "8000",
 	}
 
-	if v := lookup("APP_NAME"); v != "" {
-		s.AppName = v
-	}
-	if v := lookup("API_PREFIX"); v != "" {
-		s.APIPrefix = v
-	}
-	if v := lookup("PORT"); v != "" {
-		s.Port = v
-	}
-	if v := lookup("CORS_ORIGINS"); v != "" {
-		// Matches the Python contract: CORS_ORIGINS is JSON in .env,
-		// e.g. ["http://localhost:5173"]. Fall back to a comma-separated
-		// list so a non-JSON value still does something sensible.
+	// CORS_ORIGINS is JSON, e.g. ["http://localhost:5173"]. Unmarshal into
+	// a temporary so a malformed value leaves the default intact.
+	if v := env("CORS_ORIGINS", ""); v != "" {
 		var origins []string
-		if err := json.Unmarshal([]byte(v), &origins); err == nil {
-			s.CORSOrigins = origins
+		if err := json.Unmarshal([]byte(v), &origins); err != nil {
+			log.Printf("config: CORS_ORIGINS is not valid JSON (%v); using %v", err, s.CORSOrigins)
 		} else {
-			parts := strings.Split(v, ",")
-			for i := range parts {
-				parts[i] = strings.TrimSpace(parts[i])
-			}
-			s.CORSOrigins = parts
+			s.CORSOrigins = origins
 		}
 	}
 
 	return s
 }
 
-// lookup resolves a key case-insensitively, matching pydantic-settings behavior.
-func lookup(key string) string {
-	if v, ok := os.LookupEnv(key); ok {
+// env resolves key case-insensitively, returning fallback when unset or
+// empty.
+func env(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
 		return v
 	}
-	if v, ok := os.LookupEnv(strings.ToLower(key)); ok {
+	if v := os.Getenv(strings.ToLower(key)); v != "" {
 		return v
 	}
-	return ""
+	return fallback
 }

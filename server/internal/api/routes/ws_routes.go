@@ -3,6 +3,7 @@ package routes
 import (
 	"log"
 	"net/http"
+	"slices"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
@@ -41,10 +42,8 @@ func originChecker(allowed []string) func(*http.Request) bool {
 			// forge, so nothing to defend against here.
 			return true
 		}
-		for _, o := range allowed {
-			if o == "*" || o == origin {
-				return true
-			}
+		if slices.Contains(allowed, "*") || slices.Contains(allowed, origin) {
+			return true
 		}
 		log.Printf("ws: rejected origin %q", origin)
 		return false
