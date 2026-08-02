@@ -18,10 +18,6 @@ import (
 	"github.com/lavale1012/net-monitor/server/internal/ws"
 )
 
-// sampleInterval is how often the machine is sampled and a frame pushed
-// to connected dashboards.
-const sampleInterval = time.Second
-
 func main() {
 	settings := core.Load()
 
@@ -36,7 +32,7 @@ func main() {
 
 	packets := &ws.Sampler{
 		Hub:      hub,
-		Interval: sampleInterval,
+		Interval: settings.SampleInterval,
 		Type:     "packets",
 		Source: func() (any, error) {
 			return network.GetLivePackets()
