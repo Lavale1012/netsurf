@@ -6,28 +6,35 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A personal network monitoring tool. It watches **this machine's own** network activity and streams it to a browser dashboard in real time. Single-user, local-only — there is no multi-tenancy and no remote agent.
 
-The backend samples the system on a fixed interval from a background asyncio task and pushes snapshots to the frontend over a WebSocket. The frontend consumes that stream and draws live charts.
+A background sampler polls the system on a fixed interval and pushes frames to the frontend over a WebSocket. The frontend consumes that stream and draws live charts.
 
 Four things are monitored:
 
 - **Per-connection live view** — remote host, port, owning application, connection state.
-- **Throughput over time** — derived by diffing consecutive `net_io_counters()` readings.
+- **Throughput over time** — derived by diffing consecutive IO counter readings.
 - **Per-application rollups** — connections and traffic grouped by owning process.
 - **Remote-endpoint enrichment** — hostname and geo for remote IPs.
 
 ## Project state
 
-Early scaffold. The FastAPI app boots and serves placeholder routes returning hardcoded literals, but **none of the monitoring described above is implemented yet**. `server/app/models/`, `schemas/`, `db/`, `bin/`, `api/helpers/user/`, `server/tests/`, and both `infra/*.tf` files are empty placeholders. Treat empty directories as intent — they mark where a layer belongs.
+Early. The Go/Gin backend boots, serves the routes below, and streams over a WebSocket. Of the four features above, **only the connection listing is implemented.**
 
-`user_routes.py` is leftover boilerplate returning fake users; it is not part of the product.
+- `internal/api/helpers/network/livePackets.go` — `GetLivePackets()` is a **stub returning an empty slice**, and it is the only source wired into the sampler. The socket currently broadcasts `{"type":"packets","ts":…,"data":[]}` every tick. The user is implementing this; do not fill it in unless asked.
+- `user_routes.go` is leftover scaffold returning fake users. It is not part of the product and predates the Go rewrite.
+- `client/` is an untouched Vite scaffold — no API calls, no WebSocket consumer yet.
+- `infra/*.tf` are empty placeholders.
+
+The backend was ported from Python/FastAPI. That implementation is preserved in git at `e793086` if you need to check how something worked; it is not on disk.
 
 ## Commands
 
-Backend (run from `server/` — see import-root note below):
+Backend (from `server/`):
 
 ```bash
-sudo .venv/bin/uvicorn app.main:app --reload   # see privileges section
-.venv/bin/pip install -r reqirments.txt        # note: filename is misspelled in-repo
+go run ./cmd/server        # starts on 127.0.0.1:8000
+go build ./...
+go vet ./...
+go test -race ./...        # tests live in internal/ws and internal/core
 ```
 
 Frontend (from `client/`):
@@ -39,58 +46,91 @@ bun run build      # tsc -b && vite build
 bun run lint
 ```
 
-No test runner is configured in either project yet. Bun is the client package manager (`bun.lock`, no npm or yarn lockfile).
+Bun is the client package manager (`bun.lock`, no npm or yarn lockfile). The client has no test runner.
 
-## Privileges — read before debugging "empty connection list"
+## Privileges — this differs from the Python implementation
 
-Verified on this machine (macOS, psutil 7.2.2): **`psutil.net_connections()` raises `AccessDenied` without elevated privileges.** Not a partial result — it throws.
+**Verified on this machine: `gopsutil`'s `net.Connections("inet")` works without elevated privileges.** It returned 10–15 real established connections running as the normal user.
 
-The split matters, because the two data sources degrade differently:
+This is a genuine behavioral difference from the psutil version, which raised `AccessDenied` and forced the whole app to run under `sudo`. gopsutil shells out to `lsof` on macOS rather than using the restricted syscall. **Do not add `sudo` to the run instructions for the connection features** — it is not needed and was only ever a psutil constraint.
 
-| Call | Unprivileged | Notes |
-| --- | --- | --- |
-| `psutil.net_io_counters()` | works | throughput charts function without sudo |
-| `psutil.Process().net_connections()` | works | own process only |
-| `psutil.net_connections()` | **AccessDenied** | system-wide listing; needs sudo on macOS/Windows |
+Unverified, but expected: running as root lists connections owned by *other* users too, where unprivileged sees only your own.
 
-So an empty or failed connection list with working throughput graphs is almost certainly a privilege problem, not a bug in the sampling code. Run the backend under `sudo` for the connection features. The connection collector should catch `AccessDenied` at the top level and surface a clear "needs elevated privileges" state to the dashboard rather than presenting an empty list, which is indistinguishable from "no active connections."
+Packet capture is the exception. Raw capture on macOS requires access to `/dev/bpf*`, which does need elevated privileges. If `GetLivePackets` grows a libpcap/`gopacket` implementation, expect the privilege requirement to return **for that feature only**. `gopacket` is not currently a dependency.
+
+`ErrConnectionsUnavailable` → HTTP 503 is still wired up in `connections.go` for the case where a permission error does occur; it is simply not the normal path.
 
 ## Data collection conventions
 
-These are correctness requirements, not style preferences. Each one corresponds to a real failure mode.
+These are correctness requirements, not style preferences. Each corresponds to a real failure mode.
 
-**Throughput is a difference, never a reading.** `net_io_counters()` returns cumulative counters since boot. A single sample carries no rate information. Always retain the previous reading plus its timestamp and compute the delta over the elapsed interval. Use the measured elapsed time, not the nominal interval — the loop will drift under load, and dividing by the nominal value silently skews every rate.
+**Throughput is a difference, never a reading.** IO counters are cumulative since boot. A single sample carries no rate information. Retain the previous reading plus its timestamp and compute the delta over the elapsed interval. Use the *measured* elapsed time, not `SAMPLE_INTERVAL` — the loop drifts under load, and dividing by the nominal value silently skews every rate.
 
-**Guard every `psutil.Process(pid)` lookup** against `NoSuchProcess` and `AccessDenied`. Processes routinely exit between the moment `net_connections()` lists them and the moment you look up the owning process — this is a normal race, not an exceptional case, and it will crash the sampling loop if unhandled. A connection whose process has vanished should still be reported, with the app name left unknown.
+**Guard every process lookup** for the owning-process name. Processes routinely exit between the moment the connection table is read and the moment you look up the PID. This is a normal race, not an exceptional case. A connection whose process has vanished should still be reported, with the app name left unknown.
 
-**Check `conn.raddr` before using it.** Listening sockets have no remote address; `raddr` is an empty tuple. Unconditional access to `conn.raddr.ip` will crash on the first listening socket, and there is always at least one.
+**Check `Raddr.IP` before using it.** Listening sockets have no remote peer — gopsutil reports an empty `IP` string. `connections.go` filters these out; anything new reading `Raddr` must do the same check.
 
-**Keep DNS resolution off the sampling loop.** `socket.gethostbyaddr()` is slow and blocking — a handful of unresolvable IPs will stall a fixed-interval sampler well past its deadline and stall the WebSocket stream with it. Resolve out of band and cache results, keyed by IP. Emit snapshots with raw IPs immediately and let hostnames arrive in a later frame rather than blocking a snapshot on enrichment. Cache negative results too; unresolvable addresses are common and retrying them every tick is the expensive path.
+**Keep DNS resolution off the sampler.** Reverse lookups are slow and blocking, and the sampler is a fixed-interval loop shared by every connected client — a handful of unresolvable IPs stalls the whole stream, not just one frame. Resolve out of band, cache by IP, and **cache negative results too**; unresolvable addresses are common and retrying them every tick is the expensive path. Emit frames with raw IPs immediately and let hostnames arrive in a later frame.
 
-**scapy is deliberately not used yet.** It is reserved for optional packet-level inspection later. Everything in v1 comes from psutil. Don't reach for scapy to solve a problem psutil already covers — it raises the privilege requirements further and is not currently a dependency.
+**A sampler `Source` must return promptly.** Same reason. Anything that captures continuously (packets) should buffer in its own goroutine, with the `Source` draining that buffer rather than capturing synchronously.
+
+**Sources return a delta, not a cumulative total.** The sampler broadcasts whatever comes back, once per tick; consumers treat frames as increments.
 
 ## Storage
 
-**No database in v1.** Recent history lives in an in-memory `collections.deque` used as a ring buffer with a bounded `maxlen`, so eviction is automatic and memory is capped. History does not survive a restart, and that is the accepted tradeoff for now.
+**No database.** Recent frames live in a bounded in-memory buffer in the hub (`historyLimit`, 300 frames **per stream type**). Eviction is automatic and memory is capped. History does not survive a restart, and that is the accepted tradeoff.
 
-SQLite is planned for persistence later. The empty `db/` and `models/` directories are reserved for it. Don't add an ORM or a migration tool to satisfy a short-term need — a deque is the current design, not a placeholder for one.
+Don't add an ORM or a migration tool to satisfy a short-term need — the bounded buffer is the current design, not a placeholder for one.
 
 ## Backend architecture
 
-The app lives in `server/app/` and is importable as the `app` package. Every module is reached through absolute imports rooted there (`from app.core.config import settings`). **Run commands from `server/`** so that directory is on `sys.path`; running from anywhere else breaks every import.
+Module `github.com/lavale1012/net-monitor/server`, rooted at `server/`. Run all Go commands from there.
 
-Routers live in `app/api/routes/`, and each owns its `prefix` and `tags` on the `APIRouter(...)` constructor rather than repeating the path segment on every decorator. `main.py` mounts them under `settings.api_prefix`, so a full path is `api_prefix + router prefix + decorator path`. Add a router by creating the module and adding one `include_router` call.
+```text
+server/
+├── .env                                     # config, gitignored
+├── cmd/server/main.go                       # wiring: config, hub, samplers, routes, shutdown
+└── internal/
+    ├── core/config.go                       # Settings, loaded from .env
+    ├── ws/                                  # transport: hub, client pumps, sampler
+    └── api/
+        ├── routes/                          # HTTP + WS handlers
+        └── helpers/network/                 # collectors (connections, packets)
+```
 
-Configuration is centralized in `app/core/config.py` as a `pydantic-settings` `Settings` model exported as a module-level `settings` singleton, populated from `server/.env` with case-insensitive field matching. `cors_origins` is typed `list[str]` and must be **JSON-formatted** in `.env` (`["http://localhost:5173"]`) — comma-separated values will not parse. CORS is preconfigured for Vite's `:5173`.
+**Configuration** is centralized in `internal/core/config.go`, loaded from `server/.env` with case-insensitive keys. `CORS_ORIGINS` must be **JSON** (`["http://localhost:5173"]`) — a malformed value logs and falls back to the default rather than parsing as one origin. `SAMPLE_INTERVAL` is a Go duration string (`1s`, `250ms`); malformed *and* non-positive values fall back, because `time.NewTicker` panics on `<= 0`.
 
-The sampling task should be owned by the app lifespan, not started per-connection — it samples the machine, so it runs once regardless of how many dashboard clients are attached, and WebSocket handlers subscribe to its output. Sampling that stops when the last client disconnects loses history the ring buffer is meant to retain.
+`internal/core` is imported only by `main.go`. Settings are threaded to other packages as individual values, not as a `*Settings`.
+
+**Routes.** Each `Register*Routes` function in `internal/api/routes/` owns its own subgroup, and `main.go` mounts them under `settings.APIPrefix`. A full path is `APIPrefix + group + route`. Add a route by writing the registrar and adding one call in `main.go`.
+
+Note an inconsistency: `RegisterUserRoutes(rg)` and `RegisterNetworkRoutes(rg)` take only the group, while `RegisterWSRoutes(rg, hub, origins)` takes two extra positional deps. If a third registrar needs config, introduce a `Deps` struct rather than adding another positional parameter.
+
+**The sampler is owned by the process, not by connections.** One hub and one sampler per stream, started in `main.go` and stopped by context cancellation on SIGINT/SIGTERM. It samples the machine, so it runs regardless of how many clients are attached — a sampler that stopped with the last client would lose the history the buffer exists to retain.
+
+**Hub concurrency.** `Hub.clients` and `Hub.history` are owned exclusively by `Run`'s goroutine and are deliberately unsynchronized. The only cross-goroutine read is `ClientCount()`, served by an `atomic.Int64`. **Do not add a mutex back** — the invariant is that nothing outside `Run` touches those fields. If you add a method that needs them, route it through a channel into `Run`'s select, or extend the atomic pattern. `go test -race ./...` covers this.
+
+A client whose send buffer is full is dropped rather than allowed to stall the hub and every other client behind it.
+
+**Frame format.** Everything on the socket is:
+
+```json
+{"type": "packets", "ts": 1785705329723, "data": [...]}
+{"type": "packets", "ts": 1785705329723, "error": "needs elevated privileges"}
+```
+
+`type` routes the frame to a stream; history is bucketed by it, so a fast sampler cannot evict a slow one's frames from a new client's backfill. `data` and `error` are mutually exclusive in practice (`omitempty` on both).
+
+**Error frames are emitted on transition, not per tick.** A persistently failing source would otherwise fill its history with identical frames and evict the last good data. This is why a source must return an error rather than an empty result when it *cannot read* — "no data" and "cannot read" are different states, and showing an empty list for both is indistinguishable from a healthy idle machine.
+
+**Backfill ordering:** frames are ordered within each stream, but streams interleave in map-iteration order. Don't rely on a globally sorted replay; sort by `ts` client-side if needed.
 
 ### Verifying routes
 
-`app.routes` does **not** flatten included routers in this FastAPI version — mounted routers appear as opaque `_IncludedRouter` entries with no `.path`, so iterating it makes correctly-registered endpoints look missing. Verify with real requests against a running server. `fastapi.testclient.TestClient` is unavailable unless `httpx2` is installed, which is not in the requirements.
+Gin prints every registered route at startup in debug mode — that listing is authoritative. `ENDPOINTS.md` (gitignored) is a written snapshot of it. Verify behavior with real requests against a running server.
 
 ## Environment notes
 
-- Python 3.11 in `server/.venv/`. FastAPI is also installed globally but `pydantic-settings` and `psutil` are not — always use the venv binaries, never bare `python3`.
-- `psutil` is installed in the venv but **missing from `reqirments.txt`**; add it there when the collector lands. `scapy` is not installed.
-- `server/` has no `.gitignore`, so `.venv/` and `.env` are untracked but unignored. Worth adding before committing.
+- Go 1.26.3, darwin/arm64.
+- `server/.env` and `.venv/` are gitignored at the repo root. `.env` is **not** in git — recreate it from the keys listed in `internal/core/config.go` if it goes missing.
+- This machine's disk has run near capacity (97%, ~6 GB free). When it is that full, process startup and file I/O stall unpredictably — commands that normally take a second have taken minutes. If builds or servers seem to hang with ~0% CPU, check `df -h` before debugging the code.
