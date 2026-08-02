@@ -1,18 +1,48 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"log"
 	"net/http"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 
+	"github.com/lavale1012/net-monitor/server/internal/api/helpers/network"
 	"github.com/lavale1012/net-monitor/server/internal/api/routes"
 	"github.com/lavale1012/net-monitor/server/internal/core"
+	"github.com/lavale1012/net-monitor/server/internal/ws"
 )
+
+// sampleInterval is how often the machine is sampled and a frame pushed
+// to connected dashboards.
+const sampleInterval = time.Second
 
 func main() {
 	settings := core.Load()
+
+	// Cancelled on SIGINT/SIGTERM, which stops the sampler.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	// One hub and one sampler for the process — they watch this machine,
+	// so they run regardless of how many clients are attached.
+	hub := ws.NewHub()
+	go hub.Run()
+
+	packets := &ws.Sampler{
+		Hub:      hub,
+		Interval: sampleInterval,
+		Type:     "packets",
+		Source: func() (any, error) {
+			return network.GetLivePackets()
+		},
+	}
+	go packets.Run(ctx)
 
 	r := gin.Default()
 
@@ -27,16 +57,30 @@ func main() {
 		c.JSON(http.StatusOK, gin.H{"Hello": "World"})
 	})
 	r.GET("/health", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+		c.JSON(http.StatusOK, gin.H{"status": "ok", "clients": hub.ClientCount()})
 	})
 
 	api := r.Group(settings.APIPrefix)
 	routes.RegisterUserRoutes(api)
 	routes.RegisterNetworkRoutes(api)
+	routes.RegisterWSRoutes(api, hub, settings.CORSOrigins)
 
 	addr := "127.0.0.1:" + settings.Port
-	log.Printf("%s listening on http://%s", settings.AppName, addr)
-	if err := r.Run(addr); err != nil {
-		log.Fatal(err)
+	srv := &http.Server{Addr: addr, Handler: r}
+
+	go func() {
+		log.Printf("%s listening on http://%s (ws at %s/ws)", settings.AppName, addr, settings.APIPrefix)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatal(err)
+		}
+	}()
+
+	<-ctx.Done()
+	log.Println("shutting down")
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("shutdown: %v", err)
 	}
 }
