@@ -19,3 +19,7 @@ dist/
 .DS_Store
 .vscode/
 .idea/
+
+# Go
+server/bin/
+server/server
