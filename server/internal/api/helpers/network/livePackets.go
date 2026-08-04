@@ -1,10 +1,15 @@
 package network
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"log"
+	"net"
+	"net/netip"
+	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gopacket/gopacket"
@@ -17,56 +22,111 @@ import (
 // privileges, unlike the connection table, which does not.
 var ErrCaptureUnavailable = errors.New("packet capture unavailable: needs elevated privileges (run with sudo)")
 
-// maxBuffered caps how many packets are held between sampler ticks. A busy
-// interface produces thousands per second; without a cap the buffer would
-// grow without bound and each frame would be too large for the socket.
-// Overflow is counted, not silently ignored.
-const maxBuffered = 200
+const (
+	// maxFlows bounds the accumulator between ticks. Once full, packets for
+	// new conversations are counted as overflow rather than growing the map
+	// without limit.
+	maxFlows = 4096
 
-// Packet is one captured packet, reduced to the fields worth putting on the
-// wire. gopacket.Packet itself does not marshal to useful JSON.
-type Packet struct {
-	TS    int64  `json:"ts"` // Unix milliseconds
-	Src   string `json:"src"`
-	Dst   string `json:"dst"`
-	Proto string `json:"proto"`
-	Bytes int    `json:"bytes"`
+	// maxEmit bounds what actually goes on the wire, after sorting by bytes.
+	// This multiplies with the hub's 300-frame history, so raising it is not
+	// free: at ~130 bytes per row, 100 rows is roughly 4MB retained.
+	maxEmit = 100
+
+	// snapLen must be large enough to reach the SNI extension in a TLS
+	// ClientHello, which commonly runs past 512 bytes.
+	snapLen = 1600
+)
+
+// Flow is one direction of one conversation, aggregated over a single
+// sampling interval. It is a delta, not a running total: the counters reset
+// each time the stream drains, so consumers add consecutive frames rather
+// than diffing them.
+type Flow struct {
+	Src     string `json:"src"`
+	Dst     string `json:"dst"`
+	Proto   string `json:"proto"`
+	Packets uint64 `json:"packets"`
+	Bytes   uint64 `json:"bytes"`
+	Dir     string `json:"dir"`           // "in", "out", or "local"
+	SNI     string `json:"sni,omitempty"` // TLS server name, when seen
+}
+
+// flowKey identifies one unidirectional conversation. netip.Addr is
+// comparable and so usable as a map key; net.IP is a slice and is not.
+type flowKey struct {
+	src, dst     netip.Addr
+	sport, dport uint16
+	proto        string
+}
+
+type flowStat struct {
+	packets uint64
+	bytes   uint64
+	sni     string
 }
 
 var (
 	mu       sync.Mutex
-	buffered []Packet
-	dropped  int
+	flows    = make(map[flowKey]*flowStat)
+	overflow uint64
+
+	// localIPs is swapped wholesale by a refresher goroutine, so readers
+	// never see a partially built map.
+	localIPs atomic.Pointer[map[netip.Addr]struct{}]
 
 	startErr error // set once by StartCapture; returned by every drain
 )
 
 // StartCapture opens the device and begins capturing in the background. Call
-// it once at startup. The returned error is also retained, so GetLivePackets
-// keeps reporting the same failure rather than looking merely idle.
+// it once at startup. It does not block — capture runs in its own goroutine.
 //
-// It does not block: capture runs in its own goroutine.
+// The returned error is also retained, so GetLivePackets keeps reporting the
+// same failure rather than looking merely idle.
 func StartCapture(device string) error {
-	handle, err := pcap.OpenLive(device, 1600, true, pcap.BlockForever)
+	addrs, err := localAddrs()
+	if err != nil {
+		startErr = fmt.Errorf("%w: %v", ErrCaptureUnavailable, err)
+		return startErr
+	}
+	localIPs.Store(&addrs)
+
+	handle, err := pcap.OpenLive(device, snapLen, true, pcap.BlockForever)
 	if err != nil {
 		startErr = fmt.Errorf("%w: %v", ErrCaptureUnavailable, err)
 		return startErr
 	}
 
+	// Drop broadcast and multicast in-kernel. On a home network that is most
+	// packets by count — mDNS, SSDP, ARP, neighbour discovery — and none of
+	// it is this machine talking to the internet. Filtering here is far
+	// cheaper than filtering after the copy into Go.
+	if err := handle.SetBPFFilter("(ip or ip6) and not broadcast and not multicast"); err != nil {
+		handle.Close()
+		startErr = fmt.Errorf("%w: bpf filter: %v", ErrCaptureUnavailable, err)
+		return startErr
+	}
+
+	src := gopacket.NewPacketSource(handle, handle.LinkType())
+	// Required for the TLS layer to be reached through the TCP payload;
+	// without it decoding stops at LayerTypePayload and SNI is never seen.
+	src.DecodeStreamsAsDatagrams = true
+
 	go func() {
 		defer handle.Close()
-
-		src := gopacket.NewPacketSource(handle, handle.LinkType())
 		for pkt := range src.Packets() {
-			p := describe(pkt)
+			record(pkt)
+		}
+	}()
 
-			mu.Lock()
-			if len(buffered) < maxBuffered {
-				buffered = append(buffered, p)
-			} else {
-				dropped++
+	// Addresses change when a VPN comes up or DHCP renews. Without this,
+	// every packet would start classifying as "not ours" and the stream
+	// would silently empty.
+	go func() {
+		for range time.Tick(30 * time.Second) {
+			if a, err := localAddrs(); err == nil {
+				localIPs.Store(&a)
 			}
-			mu.Unlock()
 		}
 	}()
 
@@ -74,80 +134,213 @@ func StartCapture(device string) error {
 	return nil
 }
 
-// GetLivePackets returns the packets seen since the previous call and clears
-// the buffer, so each frame is a delta rather than a running total.
+// GetLivePackets returns the flows observed since the previous call and
+// clears the accumulator.
 //
 // It returns promptly — it only drains what the capture goroutine has already
-// collected. The sampler's loop is shared by every connected client, so this
-// must never wait on capture.
-func GetLivePackets() ([]Packet, error) {
+// folded together. The sampler's loop is shared by every connected client, so
+// this must never wait on capture.
+func GetLivePackets() ([]Flow, error) {
 	if startErr != nil {
 		return nil, startErr
 	}
 
+	// Swap the map out under the lock and format outside it, so the capture
+	// goroutine stalls for a pointer assignment rather than a full walk.
 	mu.Lock()
-	out := buffered
-	buffered = nil
-	n := dropped
-	dropped = 0
+	old := flows
+	flows = make(map[flowKey]*flowStat, len(old))
+	dropped := overflow
+	overflow = 0
 	mu.Unlock()
 
-	if n > 0 {
-		log.Printf("network: dropped %d packets (buffer full at %d)", n, maxBuffered)
+	local := localIPs.Load()
+	out := make([]Flow, 0, len(old)) // non-nil so the JSON is [] not null
+	for k, st := range old {
+		out = append(out, Flow{
+			Src:     endpoint(k.src, k.sport),
+			Dst:     endpoint(k.dst, k.dport),
+			Proto:   k.proto,
+			Packets: st.packets,
+			Bytes:   st.bytes,
+			Dir:     direction(local, k.src, k.dst),
+			SNI:     st.sni,
+		})
 	}
-	if out == nil {
-		// Non-nil so the JSON is [] rather than null.
-		out = []Packet{}
+
+	// Biggest talkers first, with a deterministic tiebreak so the order is
+	// stable across ticks.
+	slices.SortFunc(out, func(a, b Flow) int {
+		if c := cmp.Compare(b.Bytes, a.Bytes); c != 0 {
+			return c
+		}
+		if c := cmp.Compare(a.Src, b.Src); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.Dst, b.Dst)
+	})
+	if len(out) > maxEmit {
+		out = out[:maxEmit]
+	}
+
+	if dropped > 0 {
+		log.Printf("network: %d packets dropped (flow table full at %d)", dropped, maxFlows)
 	}
 	return out, nil
 }
 
-// describe reduces a decoded packet to the fields we serialize.
-func describe(pkt gopacket.Packet) Packet {
-	p := Packet{
-		TS:    time.Now().UnixMilli(),
-		Proto: "?",
-	}
+// record folds one packet into the accumulator. Everything expensive —
+// decoding, address parsing, SNI extraction — happens before the lock is
+// taken; the critical section is a map lookup and two adds.
+func record(pkt gopacket.Packet) {
+	var k flowKey
+	var netProto uint8
 
-	if md := pkt.Metadata(); md != nil {
-		if !md.Timestamp.IsZero() {
-			p.TS = md.Timestamp.UnixMilli()
-		}
-		// Length is the true size on the wire; CaptureLength is bounded by
-		// the snaplen we passed to OpenLive.
-		p.Bytes = md.Length
-	}
-
-	var srcIP, dstIP string
 	switch nl := pkt.NetworkLayer().(type) {
 	case *layers.IPv4:
-		srcIP, dstIP = nl.SrcIP.String(), nl.DstIP.String()
+		k.src, _ = netip.AddrFromSlice(nl.SrcIP)
+		k.dst, _ = netip.AddrFromSlice(nl.DstIP)
+		netProto = uint8(nl.Protocol)
 	case *layers.IPv6:
-		srcIP, dstIP = nl.SrcIP.String(), nl.DstIP.String()
+		k.src, _ = netip.AddrFromSlice(nl.SrcIP)
+		k.dst, _ = netip.AddrFromSlice(nl.DstIP)
+		netProto = uint8(nl.NextHeader)
+	default:
+		return // not an IP packet — nothing to attribute
 	}
+	k.src, k.dst = k.src.Unmap(), k.dst.Unmap()
 
+	// Take the protocol from the transport layer where there is one. IPv6
+	// NextHeader reports the first extension header (0 or 44) rather than the
+	// transport protocol, so trusting it would label real TCP traffic "0".
 	switch tl := pkt.TransportLayer().(type) {
 	case *layers.TCP:
-		p.Proto = "tcp"
 		// Cast to uint16: TCPPort.String() renders "443(https)".
-		p.Src = fmt.Sprintf("%s:%d", srcIP, uint16(tl.SrcPort))
-		p.Dst = fmt.Sprintf("%s:%d", dstIP, uint16(tl.DstPort))
-		return p
+		k.sport, k.dport = uint16(tl.SrcPort), uint16(tl.DstPort)
+		k.proto = "tcp"
 	case *layers.UDP:
-		p.Proto = "udp"
-		p.Src = fmt.Sprintf("%s:%d", srcIP, uint16(tl.SrcPort))
-		p.Dst = fmt.Sprintf("%s:%d", dstIP, uint16(tl.DstPort))
-		return p
+		k.sport, k.dport = uint16(tl.SrcPort), uint16(tl.DstPort)
+		k.proto = "udp"
+	default:
+		k.proto = protoName(netProto)
 	}
 
-	// No transport layer (ICMP, ARP, …) — report the addresses we have.
-	if l := pkt.Layer(layers.LayerTypeICMPv4); l != nil {
-		p.Proto = "icmp"
-	} else if l := pkt.Layer(layers.LayerTypeICMPv6); l != nil {
-		p.Proto = "icmp6"
-	} else if l := pkt.Layer(layers.LayerTypeARP); l != nil {
-		p.Proto = "arp"
+	var n uint64
+	if md := pkt.Metadata(); md != nil && md.Length > 0 {
+		n = uint64(md.Length) // true wire size, not the snaplen-truncated copy
+	} else {
+		n = uint64(len(pkt.Data()))
 	}
-	p.Src, p.Dst = srcIP, dstIP
-	return p
+	sni := extractSNI(pkt)
+
+	mu.Lock()
+	defer mu.Unlock()
+	st := flows[k]
+	if st == nil {
+		if len(flows) >= maxFlows {
+			overflow++
+			return
+		}
+		st = &flowStat{}
+		flows[k] = st
+	}
+	st.packets++
+	st.bytes += n
+	if sni != "" {
+		st.sni = sni
+	}
+}
+
+// extractSNI returns the server name from a TLS ClientHello, or "".
+//
+// It returns "" for almost every packet, which is expected: only ClientHello
+// is dissected (there is no ServerHello decoder), only on the ports gopacket
+// maps to TLS, and a ClientHello split across TCP segments is never
+// reassembled. Treat a hit as a bonus label, never as something to rely on.
+func extractSNI(pkt gopacket.Packet) string {
+	tls, _ := pkt.Layer(layers.LayerTypeTLS).(*layers.TLS)
+	if tls == nil {
+		return ""
+	}
+	for i := range tls.Handshake {
+		if sni := tls.Handshake[i].ClientHello.SNI; len(sni) > 0 {
+			return string(sni)
+		}
+	}
+	return ""
+}
+
+// direction reports which way a flow was going relative to this machine.
+func direction(local *map[netip.Addr]struct{}, src, dst netip.Addr) string {
+	if local == nil {
+		return ""
+	}
+	_, s := (*local)[src]
+	_, d := (*local)[dst]
+	switch {
+	case s && d:
+		return "local"
+	case s:
+		return "out"
+	case d:
+		return "in"
+	default:
+		return ""
+	}
+}
+
+// localAddrs collects this machine's unicast addresses across every
+// interface — a VPN's utun address is still this machine.
+func localAddrs() (map[netip.Addr]struct{}, error) {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[netip.Addr]struct{})
+	for _, ifc := range ifaces {
+		addrs, err := ifc.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			var ip net.IP
+			switch v := a.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			default:
+				continue
+			}
+			if addr, ok := netip.AddrFromSlice(ip); ok {
+				out[addr.Unmap()] = struct{}{}
+			}
+		}
+	}
+	if len(out) == 0 {
+		return nil, errors.New("no local addresses found")
+	}
+	return out, nil
+}
+
+// endpoint formats an address for the wire, bracketing IPv6.
+func endpoint(a netip.Addr, port uint16) string {
+	if !a.IsValid() {
+		return ""
+	}
+	if port == 0 {
+		return a.String()
+	}
+	return net.JoinHostPort(a.String(), fmt.Sprint(port))
+}
+
+func protoName(p uint8) string {
+	switch layers.IPProtocol(p) {
+	case layers.IPProtocolICMPv4:
+		return "icmp"
+	case layers.IPProtocolICMPv6:
+		return "icmp6"
+	default:
+		return layers.IPProtocol(p).String()
+	}
 }
