@@ -57,15 +57,14 @@ func main() {
 		AllowCredentials: true,
 	}))
 
-	r.GET("/", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"Hello": "World"})
-	})
+	// Liveness for this process specifically. clients comes from in-process
+	// hub state, so no other service can produce this number — the gateway
+	// proxies to it rather than reimplementing it.
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "ok", "clients": hub.ClientCount()})
 	})
 
 	api := r.Group(settings.APIPrefix)
-	routes.RegisterUserRoutes(api)
 	routes.RegisterNetworkRoutes(api)
 	routes.RegisterWSRoutes(api, hub, settings.CORSOrigins)
 
