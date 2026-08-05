@@ -6,12 +6,6 @@ import (
 	"time"
 )
 
-// Source produces one sample. An error means the source is currently
-// unavailable — which the stream reports explicitly, because "no data"
-// and "cannot read" are different states and a dashboard showing an
-// empty list for both is indistinguishable from a healthy idle machine.
-type Source func() (any, error)
-
 // Sampler drives one Source on a fixed interval and broadcasts each
 // result to the hub. It samples the machine, so exactly one runs
 // regardless of how many dashboard clients are attached — a sampler that
@@ -21,7 +15,12 @@ type Sampler struct {
 	Hub      *Hub
 	Interval time.Duration
 	Type     string
-	Source   Source
+
+	// Source produces one sample. An error means the source is currently
+	// unavailable — which the stream reports explicitly, because "no data"
+	// and "cannot read" are different states and a dashboard showing an
+	// empty list for both is indistinguishable from a healthy idle machine.
+	Source func() (any, error)
 
 	// lastErr is the most recent failure, used to emit an error frame on
 	// transition rather than every tick. Owned by Run's goroutine.

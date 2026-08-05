@@ -30,6 +30,14 @@ func main() {
 	hub := ws.NewHub()
 	go hub.Run()
 
+	// Capture runs in its own goroutine and buffers; the sampler drains it.
+	// A failure here is not fatal — capture is the only feature needing
+	// elevated privileges, and the connections API works without it. The
+	// packets stream reports its own outage over the socket.
+	if err := network.StartCapture("en0"); err != nil {
+		log.Printf("network: %v", err)
+	}
+
 	packets := &ws.Sampler{
 		Hub:      hub,
 		Interval: settings.SampleInterval,
