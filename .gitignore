@@ -26,3 +26,6 @@ server/server
 
 # Local scratch notes
 ENDPOINTS.md
+
+gateway/bin/
+gateway/obj/
