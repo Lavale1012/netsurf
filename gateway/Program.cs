@@ -1,3 +1,8 @@
+// using directives must come before any executable code. Most common
+// namespaces are already imported project-wide by <ImplicitUsings>enable</>
+// in the .csproj, which is why there is no using for WebApplication itself.
+using NetMonitor.Gateway.Endpoints;
+
 var builder = WebApplication.CreateBuilder(args);
 
 // YARP forwards the live routes to the Go service. It handles WebSocket
@@ -5,7 +10,6 @@ var builder = WebApplication.CreateBuilder(args);
 // needed here — that middleware is for terminating sockets in this app.
 builder.Services.AddReverseProxy()
     .LoadFromConfig(builder.Configuration.GetSection("ReverseProxy"));
-
 // Only needed when Vite is run without its dev proxy. With the proxy (the
 // normal path) every request reaches the gateway server-side, where CORS
 // does not apply. AllowCredentials forbids a wildcard origin, so the list
@@ -20,6 +24,8 @@ if (builder.Environment.IsDevelopment())
 }
 
 var app = builder.Build();
+// One line per endpoint group, each defined in its own file under Endpoints/.
+app.MapAuthEndpoints();
 
 if (app.Environment.IsDevelopment())
 {
