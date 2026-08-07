@@ -1,32 +1,24 @@
 package routes
 
 import (
-	"errors"
-	"net/http"
-
 	"github.com/gin-gonic/gin"
 
-	"github.com/lavale1012/net-monitor/server/internal/api/helpers/network"
+	// Go resolves packages by module path, never by file path — there is no
+	// relative import form. "helpers" here is a local alias for the package,
+	// whose real name is "network".
+	helpers "github.com/lavale1012/net-monitor/server/internal/api/helpers/network"
 )
 
 // RegisterNetworkRoutes mounts the network routes under the given group.
+//
+// Handlers here are thin by design: they call a collector in
+// helpers/network and translate its error into a status code. Collection
+// logic lives in the helper so the WebSocket samplers can reuse it — they
+// have no HTTP request to fail.
 func RegisterNetworkRoutes(rg *gin.RouterGroup) {
 	g := rg.Group("/network")
-	g.GET("/connections", listConnections)
-}
-
-func listConnections(c *gin.Context) {
-	connections, err := network.GetConnections()
-	if err != nil {
-		if errors.Is(err, network.ErrConnectionsUnavailable) {
-			c.JSON(http.StatusServiceUnavailable, gin.H{
-				"detail": "needs elevated privileges: run the server under sudo",
-			})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"data": connections})
+	g.GET("/connections", helpers.ListConnections)
+	g.GET("/throughput", helpers.GetThroughput)
+	g.GET("/hostnames", helpers.GetHostnames)
+	g.GET("/apps", helpers.GetApps)
 }
