@@ -8,6 +8,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 
+	"github.com/lavale1012/net-monitor/server/internal/api/handlers"
 	"github.com/lavale1012/net-monitor/server/internal/ws"
 )
 
@@ -23,14 +24,8 @@ func RegisterWSRoutes(rg *gin.RouterGroup, hub *ws.Hub, allowedOrigins []string)
 		CheckOrigin:     originChecker(allowedOrigins),
 	}
 
-	rg.GET("/ws", func(c *gin.Context) {
-		conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
-		if err != nil {
-			// Upgrade already wrote an error response.
-			log.Printf("ws: upgrade: %v", err)
-			return
-		}
-		ws.Serve(hub, conn)
+	rg.GET("/live-packets", func(c *gin.Context) {
+		handlers.LivePacketStream(c, hub, upgrader)
 	})
 }
 
