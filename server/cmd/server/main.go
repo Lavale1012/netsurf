@@ -43,7 +43,23 @@ func main() {
 		Interval: settings.SampleInterval,
 		Type:     "packets",
 		Source: func() (any, error) {
-			return network.GetLivePackets()
+			conns, err := network.CollectConnections()
+			if err != nil {
+				return nil, err
+			}
+			tp, err := network.CollectThroughput()
+			if err != nil {
+				return nil, err
+			}
+			apps, err := network.CollectApps()
+			if err != nil {
+				return nil, err
+			}
+			return gin.H{
+				"connections": conns,
+				"throughput":  tp,
+				"apps":        apps,
+			}, nil
 		},
 	}
 	go packets.Run(ctx)
