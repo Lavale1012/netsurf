@@ -7,7 +7,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
-	helpers "github.com/lavale1012/net-monitor/server/internal/api/helpers/network"
+	"github.com/lavale1012/net-monitor/server/internal/agent/network"
 	"github.com/lavale1012/net-monitor/server/internal/ws"
 )
 
@@ -15,16 +15,16 @@ import (
 // thin: call the matching Collect* function and translate its result into a
 // status code and the {"data": ...} envelope.
 //
-// Handlers are kept out of helpers/network so that package stays free of
+// Handlers are kept out of agent/network so that package stays free of
 // gin. The WebSocket samplers call the same collectors, and a sampler has
 // no HTTP request to fail — it needs a plain error it can turn into an
 // error frame.
 
 // ListConnections serves the live connection list.
 func ListConnections(c *gin.Context) {
-	connections, err := helpers.CollectConnections()
+	connections, err := network.CollectConnections()
 	if err != nil {
-		if errors.Is(err, helpers.ErrConnectionsUnavailable) {
+		if errors.Is(err, network.ErrConnectionsUnavailable) {
 			c.JSON(http.StatusServiceUnavailable, gin.H{
 				"detail": "needs elevated privileges: run the server under sudo",
 			})
@@ -38,7 +38,7 @@ func ListConnections(c *gin.Context) {
 
 // GetThroughput serves the current up/down rate.
 func GetThroughput(c *gin.Context) {
-	throughput, err := helpers.CollectThroughput()
+	throughput, err := network.CollectThroughput()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
 		return
@@ -48,7 +48,7 @@ func GetThroughput(c *gin.Context) {
 
 // GetHostnames serves the reverse-DNS names resolved so far.
 func GetHostnames(c *gin.Context) {
-	hostnames, err := helpers.CollectHostnames()
+	hostnames, err := network.CollectHostnames()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
 		return
@@ -58,7 +58,7 @@ func GetHostnames(c *gin.Context) {
 
 // GetApps serves per-application rollups.
 func GetApps(c *gin.Context) {
-	apps, err := helpers.CollectApps()
+	apps, err := network.CollectApps()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
 		return
@@ -73,7 +73,7 @@ func GetApps(c *gin.Context) {
 // attached client, and the sampler is what produces them — this handler
 // only has to get the socket registered.
 //
-// In particular it must NOT call helpers.GetLivePackets: that drains the
+// In particular it must NOT call network.GetLivePackets: that drains the
 // capture accumulator and returns the delta, so calling it here would
 // steal flows the sampler is about to broadcast. And it must not write a
 // JSON body: after a successful Upgrade the response is already 101
@@ -87,9 +87,9 @@ func LivePacketStream(c *gin.Context, hub *ws.Hub, upgrader websocket.Upgrader) 
 	// This must happen before the upgrade: once the handshake completes the
 	// response is 101 Switching Protocols and there is no way to report an
 	// HTTP error.
-	if dev := c.Query("device"); dev != "" && dev != helpers.CaptureDevice() {
+	if dev := c.Query("device"); dev != "" && dev != network.CaptureDevice() {
 		c.JSON(http.StatusBadRequest, gin.H{
-			"detail": "capture is running on " + helpers.CaptureDevice() + ", not " + dev,
+			"detail": "capture is running on " + network.CaptureDevice() + ", not " + dev,
 		})
 		return
 	}
