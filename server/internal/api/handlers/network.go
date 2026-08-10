@@ -80,7 +80,19 @@ func GetApps(c *gin.Context) {
 // Switching Protocols, and the connection belongs to the WebSocket.
 func LivePacketStream(c *gin.Context, hub *ws.Hub, upgrader websocket.Upgrader) {
 
-	dev := c.Query("device")
+	// One pcap handle is opened at startup and shared by every client, so a
+	// request for a different interface cannot be served. Reject it rather
+	// than accept the parameter and stream the wrong device anyway.
+	//
+	// This must happen before the upgrade: once the handshake completes the
+	// response is 101 Switching Protocols and there is no way to report an
+	// HTTP error.
+	if dev := c.Query("device"); dev != "" && dev != helpers.CaptureDevice() {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"detail": "capture is running on " + helpers.CaptureDevice() + ", not " + dev,
+		})
+		return
+	}
 
 	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
@@ -90,18 +102,8 @@ func LivePacketStream(c *gin.Context, hub *ws.Hub, upgrader websocket.Upgrader) 
 	}
 
 	// Returns immediately; the read/write pumps run in their own goroutines.
+	// Frames come from the samplers via the hub — this handler does not
+	// produce data, and must not call GetLivePackets (that drains the
+	// accumulator the packets sampler is about to broadcast).
 	ws.Serve(hub, conn)
-
-	err = helpers.StartCapture(dev)
-	if err != nil {
-		log.Printf("ws: start capture: %v", err)
-		return
-	}
-
-	flow, err := helpers.GetLivePackets()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{"data": flow})
 }

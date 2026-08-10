@@ -38,10 +38,29 @@ func main() {
 		log.Printf("network: %v", err)
 	}
 
+	// Two streams, because they are different shapes of data.
+	//
+	// "packets" is a delta — the flows seen since the last tick. It must
+	// keep draining even if nothing consumes it, or the capture accumulator
+	// fills to its cap and starts discarding.
+	//
+	// "snapshot" is current state — what is true right now. Its parts all
+	// update together, so they belong in one frame rather than racing each
+	// other into the UI as separate streams.
 	packets := &ws.Sampler{
 		Hub:      hub,
 		Interval: settings.SampleInterval,
 		Type:     "packets",
+		Source: func() (any, error) {
+			return network.GetLivePackets()
+		},
+	}
+	go packets.Run(ctx)
+
+	snapshot := &ws.Sampler{
+		Hub:      hub,
+		Interval: settings.SampleInterval,
+		Type:     "snapshot",
 		Source: func() (any, error) {
 			conns, err := network.CollectConnections()
 			if err != nil {
@@ -55,14 +74,19 @@ func main() {
 			if err != nil {
 				return nil, err
 			}
-			return gin.H{
+			hosts, err := network.CollectHostnames()
+			if err != nil {
+				return nil, err
+			}
+			return map[string]any{
 				"connections": conns,
 				"throughput":  tp,
 				"apps":        apps,
+				"hostnames":   hosts,
 			}, nil
 		},
 	}
-	go packets.Run(ctx)
+	go snapshot.Run(ctx)
 
 	r := gin.Default()
 
@@ -88,7 +112,7 @@ func main() {
 	srv := &http.Server{Addr: addr, Handler: r}
 
 	go func() {
-		log.Printf("%s listening on http://%s (ws at %s/ws)", settings.AppName, addr, settings.APIPrefix)
+		log.Printf("%s listening on http://%s (ws at %s/live-packets)", settings.AppName, addr, settings.APIPrefix)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatal(err)
 		}
