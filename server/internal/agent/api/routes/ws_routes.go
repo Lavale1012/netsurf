@@ -8,7 +8,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 
-	"github.com/lavale1012/net-monitor/server/internal/api/handlers"
+	"github.com/lavale1012/net-monitor/server/internal/agent/api/handlers"
 	"github.com/lavale1012/net-monitor/server/internal/ws"
 )
 

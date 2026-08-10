@@ -12,8 +12,8 @@ import (
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 
-	"github.com/lavale1012/net-monitor/server/internal/api/helpers/network"
-	"github.com/lavale1012/net-monitor/server/internal/api/routes"
+	"github.com/lavale1012/net-monitor/server/internal/agent/api/routes"
+	"github.com/lavale1012/net-monitor/server/internal/agent/network"
 	"github.com/lavale1012/net-monitor/server/internal/core"
 	"github.com/lavale1012/net-monitor/server/internal/ws"
 )
