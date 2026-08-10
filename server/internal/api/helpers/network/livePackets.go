@@ -76,6 +76,12 @@ var (
 	localIPs atomic.Pointer[map[netip.Addr]struct{}]
 
 	startErr error // set once by StartCapture; returned by every drain
+
+	// captureDev is the interface StartCapture opened. One handle is shared
+	// by every client, so a request asking for a different device cannot be
+	// served — the WebSocket handler rejects it rather than silently
+	// streaming the wrong interface.
+	captureDev string
 )
 
 // StartCapture opens the device and begins capturing in the background. Call
@@ -84,6 +90,8 @@ var (
 // The returned error is also retained, so GetLivePackets keeps reporting the
 // same failure rather than looking merely idle.
 func StartCapture(device string) error {
+	captureDev = device
+
 	addrs, err := localAddrs()
 	if err != nil {
 		startErr = fmt.Errorf("%w: %v", ErrCaptureUnavailable, err)
@@ -344,3 +352,7 @@ func protoName(p uint8) string {
 		return layers.IPProtocol(p).String()
 	}
 }
+
+// CaptureDevice returns the interface capture was started on, or "" if
+// StartCapture was never called.
+func CaptureDevice() string { return captureDev }
